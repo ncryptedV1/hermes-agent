@@ -917,11 +917,17 @@ def get_model_info():
         # purely auto-detected value, then separately report the override)
         try:
             from agent.model_metadata import get_model_context_length
+            try:
+                from hermes_cli.config import get_compatible_custom_providers
+                _custom_providers = get_compatible_custom_providers(cfg)
+            except Exception:
+                _custom_providers = None
             auto_ctx = get_model_context_length(
                 model=model_name,
                 base_url=base_url,
                 provider=provider,
                 config_context_length=None,  # ignore override — we want auto value
+                custom_providers=_custom_providers,
             )
         except Exception:
             auto_ctx = 0

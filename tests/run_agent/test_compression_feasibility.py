@@ -182,6 +182,7 @@ def test_feasibility_check_passes_config_context_length(mock_get_client, mock_ct
         api_key="sk-custom",
         config_context_length=1_000_000,
         provider="openrouter",
+        custom_providers=None,
     )
 
 
@@ -205,6 +206,7 @@ def test_feasibility_check_ignores_invalid_context_length(mock_get_client, mock_
         api_key="sk-test",
         config_context_length=None,
         provider="openrouter",
+        custom_providers=None,
     )
 
 
@@ -258,6 +260,7 @@ def test_init_feasibility_check_uses_aux_context_override_from_config():
         api_key="sk-custom",
         config_context_length=1_000_000,
         provider="",
+        custom_providers=[],
     )
 
 
@@ -442,3 +445,115 @@ def test_run_conversation_clears_warning_after_replay(mock_get_client, mock_ctx_
         agent._compression_warning = None
 
     assert len(callback_events) == 0
+
+
+# ── custom_providers is forwarded to the aux context-length lookup ──
+
+
+@patch("agent.model_metadata.get_model_context_length", return_value=1_000_000)
+@patch("agent.auxiliary_client.get_text_auxiliary_client")
+def test_feasibility_check_forwards_custom_providers(mock_get_client, mock_ctx_len):
+    """Regression: with provider:auto + a custom-proxy main model whose
+    context_length is declared under custom_providers, the feasibility
+    check must forward custom_providers to get_model_context_length so
+    resolution step 0b fires for the aux model too. Without this, the
+    resolver falls through to DEFAULT_FALLBACK_CONTEXT (256K) for proxies
+    that don't expose /models, producing a spurious threshold warning
+    when the user has declared 1M in custom_providers."""
+    agent = _make_agent(main_context=1_000_000, threshold_percent=0.60)
+    agent.provider = "custom"
+    agent.base_url = "https://ai-proxy.example.com/v1"
+    agent._custom_providers = [
+        {
+            "name": "ai-proxy",
+            "base_url": "https://ai-proxy.example.com/v1",
+            "model": "claude-4.7-opus",
+            "models": {
+                "claude-4.7-opus": {
+                    "context_length": 1_000_000,
+                    "max_tokens": 128_000,
+                },
+            },
+        }
+    ]
+
+    mock_client = MagicMock()
+    mock_client.base_url = "https://ai-proxy.example.com/v1"
+    mock_client.api_key = "sk-proxy"
+    mock_get_client.return_value = (mock_client, "claude-4.7-opus")
+
+    messages = []
+    agent._emit_status = lambda msg: messages.append(msg)
+    agent._check_compression_model_feasibility()
+
+    mock_ctx_len.assert_called_once_with(
+        "claude-4.7-opus",
+        base_url="https://ai-proxy.example.com/v1",
+        api_key="sk-proxy",
+        config_context_length=None,
+        provider="custom",
+        custom_providers=agent._custom_providers,
+    )
+    assert len(messages) == 0
+    assert agent._compression_warning is None
+
+
+def test_feasibility_check_resolves_custom_provider_context_length_e2e():
+    """End-to-end regression: reproduces the exact user-reported bug.
+
+    Setup mirrors the user's config — main model claude-4.7-opus on a
+    custom proxy declared with context_length: 1_000_000 in
+    custom_providers, compression provider auto (no explicit
+    auxiliary.compression.context_length override). The custom proxy
+    does not expose /models, so without the fix the resolver falls
+    through to DEFAULT_FALLBACK_CONTEXT (256K) and emits the bogus
+    "256,000 tokens, but compression threshold was 600,000" warning.
+
+    With the fix, custom_providers is forwarded and resolution step 0b
+    returns 1_000_000 — no warning, no auto-correction.
+    """
+    agent = _make_agent(main_context=1_000_000, threshold_percent=0.60)
+    agent.provider = "custom"
+    agent.base_url = "https://ai-proxy.example.com/v1"
+    agent._custom_providers = [
+        {
+            "name": "ai-proxy",
+            "base_url": "https://ai-proxy.example.com/v1",
+            "model": "claude-4.7-opus",
+            "models": {
+                "claude-4.7-opus": {
+                    "context_length": 1_000_000,
+                    "max_tokens": 128_000,
+                },
+            },
+        }
+    ]
+
+    mock_client = MagicMock()
+    mock_client.base_url = "https://ai-proxy.example.com/v1"
+    mock_client.api_key = "sk-proxy"
+
+    # Snapshot the threshold so we can assert it was NOT auto-lowered.
+    initial_threshold = agent.context_compressor.threshold_tokens
+
+    # Force every probe path in get_model_context_length to fail/skip so
+    # the only way to reach 1_000_000 is via custom_providers (step 0b).
+    with (
+        patch("agent.auxiliary_client.get_text_auxiliary_client", return_value=(mock_client, "claude-4.7-opus")),
+        patch("agent.model_metadata._resolve_endpoint_context_length", return_value=None),
+        patch("agent.model_metadata._query_ollama_api_show", return_value=None),
+        patch("agent.model_metadata.get_cached_context_length", return_value=None),
+        patch("agent.model_metadata.fetch_model_metadata", return_value={}),
+    ):
+        messages = []
+        agent._emit_status = lambda msg: messages.append(msg)
+        agent._check_compression_model_feasibility()
+
+    assert messages == [], (
+        f"No warning expected when custom_providers declares 1M context, "
+        f"got: {messages}"
+    )
+    assert agent._compression_warning is None
+    # Threshold must NOT have been auto-lowered (custom_providers reported
+    # 1M, which exceeds the 600K threshold).
+    assert agent.context_compressor.threshold_tokens == initial_threshold

@@ -2139,6 +2139,11 @@ class AIAgent:
             _custom_providers = _agent_cfg.get("custom_providers")
             if not isinstance(_custom_providers, list):
                 _custom_providers = []
+        # Persist on the instance so non-init code paths (e.g. the
+        # compression feasibility check at session start) can forward
+        # the same list to get_model_context_length() and honor per-model
+        # context_length overrides for the auxiliary/compression model.
+        self._custom_providers = _custom_providers
 
         # Check custom_providers per-model context_length
         if _config_context_length is None and _custom_providers:
@@ -2671,6 +2676,11 @@ class AIAgent:
                 _sm_custom_providers = get_compatible_custom_providers(_sm_cfg)
             except Exception:
                 _sm_custom_providers = None
+            # Refresh the cached list on the agent so other consumers
+            # (e.g. cli.py @-context-reference budgeting) see the same
+            # per-switch view rather than the stale init-time value.
+            if _sm_custom_providers is not None:
+                self._custom_providers = _sm_custom_providers
             new_context_length = get_model_context_length(
                 self.model,
                 base_url=self.base_url,
@@ -3188,6 +3198,14 @@ class AIAgent:
                 # provider-specific paths (e.g. Bedrock static table, OpenRouter API)
                 # are invoked for the correct client, not inherited from the main model.
                 provider=(_aux_cfg_provider if _aux_cfg_provider and _aux_cfg_provider != "auto" else getattr(self, "provider", "")),
+                # Forward custom_providers so per-model context_length
+                # overrides under custom_providers (resolution step 0b) are
+                # honored for the aux model too. Without this, "compression:
+                # provider: auto" against a custom proxy that doesn't expose
+                # /models would fall through to DEFAULT_FALLBACK_CONTEXT
+                # (256K) and emit a spurious threshold warning whenever the
+                # user has a larger context_length declared in custom_providers.
+                custom_providers=getattr(self, "_custom_providers", None),
             )
 
             # Hard floor: the auxiliary compression model must have at least
